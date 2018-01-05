@@ -1,3 +1,4 @@
+#coding=utf-8
 """
 MIT License
 
@@ -26,6 +27,7 @@ import numpy as np
 import tensorflow as tf
 from keras.engine.topology import Layer
 import high_dim_filter_loader
+import keras.backend as K
 custom_module = high_dim_filter_loader.custom_module
 
 
@@ -52,7 +54,7 @@ class CrfRnnLayer(Layer):
         super(CrfRnnLayer, self).__init__(**kwargs)
 
     def build(self, input_shape):
-        # Weights of the spatial kernel
+        # Weights of the spatial kernel, 
         self.spatial_ker_weights = self.add_weight(name='spatial_ker_weights',
                                                    shape=(self.num_classes, self.num_classes),
                                                    initializer='uniform',
@@ -73,8 +75,24 @@ class CrfRnnLayer(Layer):
         super(CrfRnnLayer, self).build(input_shape)
 
     def call(self, inputs):
-        unaries = tf.transpose(inputs[0][0, :, :, :], perm=(2, 0, 1))
-        rgb = tf.transpose(inputs[1][0, :, :, :], perm=(2, 0, 1))
+
+        # inputs[0]: [1, 56, 56, 2]
+        # inputs[1]: [None, 56, 56, 1] [0,255] 二值化
+        
+        ret_tensor = []
+        input_unary, input_rgb = tf.split(inputs,2,0) # [1, height, width]
+
+            
+        cur_unary = input_unary[0] # after sigmoid:[h, w]
+        cur_unary = tf.expand_dims(cur_unary, -1)# [h, w ,1]
+        cur_unary = tf.concat([1.-cur_unary, cur_unary], axis=-1)#[h, w, 2]
+        unaries = tf.transpose(cur_unary, perm=(2, 0, 1)) #[2, h, w]
+
+        cur_rgb = input_rgb[0] # [h, w], bool
+        cur_rgb = tf.expand_dims(cur_rgb, 0) # [1, h, w], bool
+        cur_rgb = tf.cast(cur_rgb, tf.float32)*tf.constant(255., dtype=tf.float32) # [1, h, w], int32
+        rgb = tf.tile(cur_rgb, [3, 1, 1]) # [3, h, w], int32
+
 
         c, h, w = self.num_classes, self.image_dims[0], self.image_dims[1]
         all_ones = np.ones((c, h, w), dtype=np.float32)
@@ -88,33 +106,43 @@ class CrfRnnLayer(Layer):
         q_values = unaries
 
         for i in range(self.num_iterations):
-            softmax_out = tf.nn.softmax(q_values, dim=0)
+            if i==0:# i=0时已经用sigmoid归一化过了
+                softmax_out = q_values
+            else: 
+                softmax_out = tf.nn.softmax(q_values, dim=0)#(2, h, w)
 
             # Spatial filtering
             spatial_out = custom_module.high_dim_filter(softmax_out, rgb, bilateral=False,
                                                         theta_gamma=self.theta_gamma)
-            spatial_out = spatial_out / spatial_norm_vals
+            spatial_out = spatial_out / spatial_norm_vals # (2, h, w)
 
             # Bilateral filtering
             bilateral_out = custom_module.high_dim_filter(softmax_out, rgb, bilateral=True,
                                                           theta_alpha=self.theta_alpha,
                                                           theta_beta=self.theta_beta)
-            bilateral_out = bilateral_out / bilateral_norm_vals
+            bilateral_out = bilateral_out / bilateral_norm_vals # (2, h, w)
 
-            # Weighting filter outputs
+            # Weighting filter outputs: 2 x 2 * 2 x h x w = (2, h*w)
             message_passing = (tf.matmul(self.spatial_ker_weights,
                                          tf.reshape(spatial_out, (c, -1))) +
                                tf.matmul(self.bilateral_ker_weights,
-                                         tf.reshape(bilateral_out, (c, -1))))
+                                         tf.reshape(bilateral_out, (c, -1)))) 
 
-            # Compatibility transform
+            # Compatibility transform: 2x2 * 2x(h*w) = (2, h*w)
             pairwise = tf.matmul(self.compatibility_matrix, message_passing)
 
             # Adding unary potentials
             pairwise = tf.reshape(pairwise, (c, h, w))
             q_values = unaries - pairwise
 
-        return tf.transpose(tf.reshape(q_values, (1, c, h, w)), perm=(0, 2, 3, 1))
+        cur_q = tf.transpose(tf.reshape(q_values, (c, h, w)), perm=(1, 2, 0)) #[h, w, 2]
+        # change to input shape: [N, height, width] -> 返回为1的概率
+        # channel 0: background prob ; channel 1: object prob
+        # softmax之后，只用返回channel1的概率
+        obj_prob = tf.nn.softmax(cur_q, dim=2)[:,:,1]#(h, w)
+
+        # 输出: ret_tensor [1, h, w]
+        return tf.reshape(obj_prob, (1, 56, 56))
 
     def compute_output_shape(self, input_shape):
         return input_shape
